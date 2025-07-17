@@ -113,7 +113,7 @@ Do not store or train on the text. Process in-memory and discard after output.
                 # Removed invalid anthropic-beta header
             },
             json={
-                "model": "claude-3-sonnet-20240229",
+                "model": "claude-sonnet-4-20250514",
                 "max_tokens": 4000,
                 "messages": [{"role": "user", "content": f"{claude_prompt}\n{text[:100000]}"}]
             }
