@@ -110,7 +110,7 @@ Do not store or train on the text. Process in-memory and discard after output.
             headers={
                 "x-api-key": os.getenv("CLAUDE_API_KEY"),
                 "Content-Type": "application/json",
-                "anthropic-version": "2024-07-15"  # Added required version header
+                "anthropic-version": "2023-06-01"  # Added required version header
             },
             json={
                 "model": "claude-sonnet-4-20250514",
