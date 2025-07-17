@@ -4,17 +4,19 @@ import uuid
 import os
 import pdfplumber
 import json
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+import boto3
+from botocore.exceptions import ClientError
 
 app = FastAPI()
 
-# Google Drive setup (assumes credentials.json in project root)
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # Set in Render
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-drive_service = build("drive", "v3", credentials=creds)
+# AWS S3 setup
+s3_client = boto3.client(
+    "s3",
+    region_name=os.getenv("AWS_REGION", "us-east-1"),
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+)
+BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
 @app.get("/")
 def read_root():
@@ -30,9 +32,10 @@ async def process_lease(request: Request):
         return {"status": "error", "message": "Missing file URL or email."}
 
     # Generate unique filenames
-    unique_id = str(uuid.uuid4())[:8]
+    unique_id = uuid.uuid4().hex
     filename = f"/tmp/lease_{unique_id}.pdf"  # Ephemeral storage
     report_filename = f"/tmp/report_{unique_id}.txt"
+    s3_report_key = f"reports/{unique_id}/report.txt"  # Unique S3 key
 
     try:
         # Download PDF from Tally URL
@@ -47,7 +50,7 @@ async def process_lease(request: Request):
 
         # Claude prompt for comprehensive clause extraction
         claude_prompt = """
-Act as an expert CRE lease analyst. Analyze the provided lease text to extract all critical clauses, ensuring no key details are missed. Extract:
+Act as an expert CRE lease analyst. Analyze the provided lease text (50-100 pages) to extract all critical clauses, ensuring no key details are missed. Extract:
 - Offer and acceptance (parties, key terms)
 - Rent (base, escalations, percentage rent)
 - Lease term (start/end dates, renewals)
@@ -89,7 +92,7 @@ Do not store or train on the text. Process in-memory and discard after output.
             json={
                 "model": "claude-3-sonnet-20240229",
                 "max_tokens": 4000,
-                "messages": [{"role": "user", "content": f"{claude_prompt}\n{text[:100000]}"}]  # Adjust for 200k token limit
+                "messages": [{"role": "user", "content": f"{claude_prompt}\n{text[:100000]}"}]
             }
         )
         claude_response.raise_for_status()
@@ -101,7 +104,7 @@ Do not store or train on the text. Process in-memory and discard after output.
         missing_clauses = [item for item in checklist if item not in [c["type"].lower() for c in claude_data.get("clauses", [])] + claude_data.get("missing_clauses", [])]
         if missing_clauses:
             # Optional: Re-run Claude for missing clauses
-            pass  # Add logic if needed
+            pass
 
         # Grok prompt for risk analysis and investor summary
         grok_prompt = """
@@ -110,7 +113,7 @@ Act as a CRE risk analyst. Using the provided JSON of lease clauses, perform:
 2. Risk severity: High (>25% NOI), moderate (10-25%), low (<10%).
 3. Manual review: Flag clauses with <90% confidence with page numbers.
 4. Deal Impact Score: 1-10 (10=no risks, -1/low risk, -2/moderate, -3/high, -0.5/low-confidence).
-5. Investor summary: 50-word LP summary (e.g., "Low-risk lease, stable cash flow").
+5. Investor summary: succinct but comprehensive LP summary (e.g., "Low-risk lease, stable cash flow").
 Use DeepSearch for CRE context (e.g., retail co-tenancy risks). Output JSON:
 {
   "risks": [
@@ -161,34 +164,32 @@ Do not store or train on data. Process in-memory and discard.
             f"**Deal Impact Score**: {grok_result.get('deal_impact_score', 8)}/10 ({'Low' if grok_result.get('deal_impact_score', 8) >= 8 else 'Moderate'} Risk)\n"
         )
 
-        # Save report to Google Drive
-        file_metadata = {
-            "name": f"report_{unique_id}.txt",
-            "parents": [DRIVE_FOLDER_ID],
-            "description": "LeaseScan AI report for internal review, auto-deletes after 24 hours"
-        }
-        media = MediaFileUpload(report_filename, mimetype="text/plain")
-        file = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, webViewLink"
-        ).execute()
-        report_url = file.get("webViewLink")  # Secure URL for your review
-
-        # Save report locally for user delivery
+        # Save report locally for upload
         with open(report_filename, "w") as f:
             f.write(report_content)
+
+        # Upload report to S3
+        s3_client.upload_file(
+            report_filename,
+            BUCKET_NAME,
+            s3_report_key
+        )
+
+        # Generate presigned URL for user delivery (24-hour expiry)
+        report_url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET_NAME, "Key": s3_report_key},
+            ExpiresIn=86400  # 24 hours
+        )
 
         # Clean up local files
         os.remove(filename)
         os.remove(report_filename)
 
-        # Schedule Drive file for auto-deletion (24 hours)
-        # Note: Run this separately in Google Apps Script or cron job
         return {
             "status": "success",
             "message": "Lease processed successfully",
-            "report_url": report_url,  # User gets this via email/Zapier
+            "report_url": report_url,
             "email": email
         }
 
@@ -196,6 +197,11 @@ Do not store or train on data. Process in-memory and discard.
         return {
             "status": "error",
             "message": f"Failed to download or process file: {str(e)}"
+        }
+    except ClientError as e:
+        return {
+            "status": "error",
+            "message": f"S3 error: {str(e)}"
         }
     except Exception as e:
         return {
