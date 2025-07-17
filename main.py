@@ -108,18 +108,32 @@ Do not store or train on the text. Process in-memory and discard after output.
             headers={
                 "x-api-key": os.getenv("CLAUDE_API_KEY"),
                 "Content-Type": "application/json",
-                "anthropic-beta": "no-user-data-training"
+                "anthropic-version": "2023-06-01"
             },
             json={
                 "model": "claude-3-sonnet-20240229",
                 "max_tokens": 4000,
-                "messages": [{"role": "user", "content": f"{claude_prompt}\n{text[:100000]}"}]
+                "temperature": 0.7,
+                "system": "You are an expert lease analyst. Extract and summarize risks from lease text.",
+                "messages": [
+                    {"role": "user", "content": f"{claude_prompt}\n{text[:100000]}"}
+                ]
             }
         )
         claude_response.raise_for_status()
-        claude_result = claude_response.json().get("content", [{}])[0].get("text", "{}")
-        claude_data = json.loads(claude_result)
-        logger.info(f"Claude API returned {len(claude_data.get('clauses', []))} clauses, trust_score: {claude_data.get('trust_score', 'N/A')}")
+        
+        # Parse Claude response
+        claude_json = claude_response.json()
+        claude_text = claude_json.get("content", [{}])[0].get("text", "")
+        
+        try:
+            claude_data = json.loads(claude_text)
+            logger.info(f"Claude API returned {len(claude_data.get('clauses', []))} clauses, trust_score: {claude_data.get('trust_score', 'N/A')}")
+        except json.JSONDecodeError:
+            logger.error("Claude response could not be parsed as JSON.")
+            logger.debug(f"Raw Claude text: {claude_text}")
+            raise
+        
 
         # Validate Claude output
         checklist = ["rent", "term", "termination", "co-tenancy", "CAM", "maintenance"]
