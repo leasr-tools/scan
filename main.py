@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# AWS S3 setup
+# Set up AWS S3
 s3_client = boto3.client(
     "s3",
     region_name=os.getenv("AWS_REGION", "us-east-1"),
