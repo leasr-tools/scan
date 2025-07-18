@@ -5,3 +5,6 @@ boto3==1.35.24
 python-multipart==0.0.12
 uvicorn==0.30.6
 reportlab
+pdfplumber
+pdf2image
+pytesseract
