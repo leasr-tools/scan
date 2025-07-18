@@ -8,6 +8,9 @@ import boto3
 from botocore.exceptions import ClientError
 import logging
 import re  # Added for regex processing
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 
 # Configure logging
 logging.basicConfig(
@@ -29,6 +32,67 @@ s3_client = boto3.client(
 BUCKET_NAME = os.getenv("AWS_S3_BUCKET")
 if not BUCKET_NAME:
     raise ValueError("AWS_S3_BUCKET environment variable is not set")
+
+def get_grok_risk_prompt():
+    return """
+Act as a Commercial Real Estate risk analyst. Using the provided JSON of lease clauses, perform a comprehensive risk analysis:
+
+0. DeepSearch for Context
+- Infer missing risks from clauses and identify property type (retail, industrial, office) to adjust risk detection:
+  * Retail: co-tenancy, percentage rent.
+  * Industrial: environmental liability, maintenance.
+  * Office: CAM caps, occupancy risks.
+- Note unusual terms (e.g., missing escalations) in risk categories.
+
+1. Risk Identification & Quantification
+- Evaluate each clause (e.g., termination, rent, CAM).
+- Use provided NOI or annual rent as proxy if NOI is missing; avoid assumptions otherwise.
+- Estimate NOI impact ($/year) with rationale when data allows.
+
+2. Risk Severity
+- High (>25% NOI), moderate (10-25%), low (<10%); use qualitative severity if NOI is unknown.
+
+3. Confidence & Manual Review
+- Flag <90% confidence, missing data, or ambiguity with page and reason.
+
+4. Deal Impact Score
+- Start at 10, deduct -2 (high), -1 (moderate), -0.5 (low), -0.5 (manual review), cap at 1.
+- Provide score_explanation and total_risk_impact by category (termination, financial, operational, environmental).
+
+5. Financial & Lease Structure
+- Highlight rent gaps, CAM absence, lease_type (NNN/gross), and expense responsibilities.
+
+6. Property & Tenant Context
+- Assess tenant credit (if data), deposit, guarantees based on JSON.
+
+7. Environmental & Legal
+- Flag missing hazardous material or zoning clauses with qualitative notes.
+
+8. Insurance
+- Assess coverage adequacy; flag missing business interruption insurance.
+
+9. Risk Traceability
+- Include reason for each risk severity, avoiding duplicates.
+
+10. Investor Summary
+- 75-word summary of strengths, risks, and cash flow outlook.
+
+11. JSON Output
+{
+  "lease_type": "NNN",
+  "risks": [{"type": "termination_early", "noi_impact": 120000, "severity": "high", "reason": "...", "manual_review": false, "page": 1}],
+  "risk_categories": {"termination": 120000, ...},
+  "total_risk_impact": 165000,
+  "deal_impact_score": 6.5,
+  "score_explanation": "...",
+  "review_manually": [{"type": "rent_base", "page": 2, "reason": "..."}],
+  "financial_flags": [{"type": "missing_escalation", "impact": "..."}],
+  "security_measures": {"deposit": 20000, "guarantee": "Unknown", "tenant_credit": "Unknown"},
+  "time_risks": [{"type": "lease_expiration", "date": "2025-05-31", "impact": "..."}],
+  "market_comparison": {"rent_escalation": "Unknown", "cam_caps": "Unknown"},
+  "investor_summary": "..."
+}
+"""
 
 @app.get("/")
 def read_root():
@@ -55,9 +119,9 @@ async def process_lease(request: Request):
         # Generate unique filenames
         unique_id = uuid.uuid4().hex
         filename = f"/tmp/lease_{unique_id}.pdf"
-        report_filename = f"/tmp/report_{unique_id}.txt"
-        s3_report_key = f"reports/{unique_id}/report.txt"
-        logger.info(f"Generated unique_id: {unique_id}, s3_report_key: {s3_report_key}")
+        pdf_filename = f"/tmp/report_{unique_id}.pdf"
+        s3_pdf_key = f"reports/{unique_id}/report.pdf"
+        logger.info(f"Generated unique_id: {unique_id}, s3_pdf_key: {s3_pdf_key}")
 
         # Download PDF from Tally URL
         logger.info(f"Downloading PDF from {file_url}")
@@ -142,33 +206,12 @@ Do not store or train on the text. Process in-memory and discard after output.
             # Optional: Re-run Claude for missing clauses
             pass
 
-        # Grok prompt for risk analysis and investor summary
-        grok_prompt = """
-Act as a Commercial Real Estate risk analyst. Using the provided JSON of lease clauses, perform:
-1. Risk analysis: Quantify NOI impact ($/year) for each clause (assume NOI=$120,000 unless specified).
-2. Risk severity: High (>25% NOI), moderate (10-25%), low (<10%).
-3. Manual review: Flag clauses with <90% confidence with page numbers.
-4. Deal Impact Score: 1-10 (10=no risks, -1/low risk, -2/moderate, -3/high, -0.5/low-confidence).
-5. Investor summary: 50-word LP summary (e.g., "Low-risk lease, stable cash flow").
-Use DeepSearch for CRE context (e.g., retail co-tenancy risks). Output JSON:
-{
-  "risks": [
-    {"type": "termination", "noi_impact": 48000, "severity": "high", "manual_review": false},
-    ...
-  ],
-  "deal_impact_score": 8,
-  "review_manually": [{"type": "CAM", "page": 25, "reason": "Confidence 82%"}],
-  "investor_summary": "..."
-}
-Do not store or train on data. Process in-memory and discard.
-"""
-
         # Grok API call with /v1/messages endpoint
         logger.info("Calling Grok API")
         grok_payload = {
             "model": "grok-3",  # Adjust to the correct model name from documentation
             "messages": [
-                {"role": "system", "content": grok_prompt},
+                {"role": "system", "content": get_grok_risk_prompt()},
                 {"role": "user", "content": json.dumps(claude_data)}
             ],
             "max_tokens": 2000
@@ -188,56 +231,57 @@ Do not store or train on data. Process in-memory and discard.
         grok_result = json.loads(grok_data)
         logger.info(f"Grok API returned {len(grok_result.get('risks', []))} risks, deal_impact_score: {grok_result.get('deal_impact_score', 'N/A')}")
 
-        # Generate report
-        logger.info("Generating report")
-        report_content = (
-            f"# Lease Summary Report\n"
-            f"**Property**: [Property Name]\n"
-            f"**Uploaded**: {os.getenv('CURRENT_DATE', '2025-07-17 20:44:00 CDT')}\n"  # Updated to current time
-            f"**Generated by**: LeaseScan AI\n"
-            f"**Trust Score**: {claude_data.get('trust_score', 95)}%\n\n"
-            f"## Key Details\n"
-        )
+        # Generate PDF report
+        logger.info("Generating PDF report")
+        pdf = SimpleDocTemplate(pdf_filename, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+        story.append(Paragraph(f"<b>Lease Summary Report</b>", styles['Heading1']))
+        story.append(Paragraph(f"<b>Property</b>: [Property Name]", styles['Normal']))
+        story.append(Paragraph(f"<b>Uploaded</b>: {os.getenv('CURRENT_DATE', '2025-07-17 22:59:00 CDT')}", styles['Normal']))
+        story.append(Paragraph(f"<b>Generated by</b>: LeaseScan AI", styles['Normal']))
+        story.append(Paragraph(f"<b>Trust Score</b>: {claude_data.get('trust_score', 95)}%", styles['Normal']))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("<b>Key Details</b>", styles['Heading2']))
         for clause in claude_data.get("clauses", []):
-            report_content += f"- **{clause['type'].title()}**: {clause['description']} (Page {clause['page']}, {clause['confidence']}%)\n"
+            story.append(Paragraph(f"- <b>{clause['type'].title()}</b>: {clause['description']} (Page {clause['page']}, {clause['confidence']}%", styles['Normal']))
         if claude_data.get("missing_clauses"):
-            report_content += f"- **Missing Clauses**: {', '.join(clause.title() for clause in claude_data['missing_clauses'])}\n"
-        report_content += "\n## Risk Flags\n"
+            story.append(Paragraph(f"- <b>Missing Clauses</b>: {', '.join(clause.title() for clause in claude_data['missing_clauses'])}", styles['Normal']))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("<b>Risk Flags</b>", styles['Heading2']))
         if not grok_result.get("risks"):
-            report_content += "- **No Significant Risks Found**: All clauses indicate low or no financial/operational risk.\n"
+            story.append(Paragraph("- <b>No Significant Risks Found</b>: All clauses indicate low or no financial/operational risk.", styles['Normal']))
         for risk in grok_result.get("risks", []):
-            report_content += f"- **{risk['type'].title()}** (Page {risk.get('page', 'N/A')}): ${risk['noi_impact']}/year, {risk['severity']} risk\n"
+            story.append(Paragraph(f"- <b>{risk['type'].title()}</b> (Page {risk.get('page', 'N/A')}): ${risk['noi_impact']}/year, {risk['severity']} risk", styles['Normal']))
         if grok_result.get("review_manually"):
-            report_content += "\n## Review Manually to Validate\n"
+            story.append(Spacer(1, 12))
+            story.append(Paragraph("<b>Review Manually to Validate</b>", styles['Heading2']))
             for item in grok_result["review_manually"]:
-                report_content += f"- **Page {item['page']}, {item['type'].title()}**: {item['reason']}\n"
-        report_content += (
-            f"\n## Investor Summary\n"
-            f"{grok_result.get('investor_summary', 'Stable lease with minimal risks.')}\n"
-            f"**Deal Impact Score**: {grok_result.get('deal_impact_score', 8)}/10 ({'Low' if grok_result.get('deal_impact_score', 8) >= 8 else 'Moderate'} Risk)\n"
-        )
+                story.append(Paragraph(f"- <b>Page {item['page']}, {item['type'].title()}</b>: {item['reason']}", styles['Normal']))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("<b>Investor Summary</b>", styles['Heading2']))
+        story.append(Paragraph(grok_result.get('investor_summary', 'Stable lease with minimal risks.'), styles['Normal']))
+        story.append(Paragraph(f"<b>Deal Impact Score</b>: {grok_result.get('deal_impact_score', 8)}/10 ({'Low' if grok_result.get('deal_impact_score', 8) >= 8 else 'Moderate'} Risk)", styles['Normal']))
 
-        # Save report locally for upload
-        logger.info(f"Saving report to {report_filename}")
-        with open(report_filename, "w") as f:
-            f.write(report_content)
+        pdf.build(story)
+        logger.info(f"PDF generated at {pdf_filename}")
 
-        # Upload report to S3
-        logger.info(f"Uploading report to S3: {s3_report_key}")
-        s3_client.upload_file(report_filename, BUCKET_NAME, s3_report_key)
+        # Upload PDF to S3
+        logger.info(f"Uploading PDF to S3: {s3_pdf_key}")
+        s3_client.upload_file(pdf_filename, BUCKET_NAME, s3_pdf_key, ExtraArgs={'ContentType': 'application/pdf'})
 
         # Generate presigned URL for user delivery (24-hour expiry)
         logger.info("Generating S3 presigned URL")
         report_url = s3_client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": BUCKET_NAME, "Key": s3_report_key},
+            Params={"Bucket": BUCKET_NAME, "Key": s3_pdf_key},
             ExpiresIn=86400
         )
 
         # Clean up local files
-        logger.info(f"Cleaning up local files: {filename}, {report_filename}")
+        logger.info(f"Cleaning up local files: {filename}, {pdf_filename}")
         os.remove(filename)
-        os.remove(report_filename)
+        os.remove(pdf_filename)
 
         logger.info(f"Lease processing completed successfully, report_url: {report_url}")
         return {
