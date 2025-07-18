@@ -3,6 +3,8 @@ import requests
 import uuid
 import os
 import pdfplumber
+from pdf2image import convert_from_path
+import pytesseract
 import json
 import boto3
 from botocore.exceptions import ClientError
@@ -43,11 +45,13 @@ Act as a Commercial Real Estate risk analyst. Using the provided JSON of lease c
   * Industrial: environmental liability, maintenance.
   * Office: CAM caps, occupancy risks.
 - Note unusual terms (e.g., missing escalations) in risk categories.
+- Validate rent schedule from clauses; flag gaps or inconsistencies for manual review.
 
 1. Risk Identification & Quantification
 - Evaluate each clause (e.g., termination, rent, CAM).
-- Use provided NOI or annual rent as proxy if NOI is missing; avoid assumptions otherwise.
-- Estimate NOI impact ($/year) with rationale when data allows.
+- Use provided NOI or annual rent as proxy if NOI is missing; if rent data is incomplete (e.g., gaps), estimate based on prior year and flag for review.
+- Estimate NOI impact ($/year) with rationale when data allows. For each calculated NOI impact, include a 'calculation' field with a clear breakdown (e.g., '$840,000/year = $70,000/month × 12 months' or '$300,000 = early termination penalty').
+- Identify positive aspects (e.g., strong tenant credit, favorable rent escalations) and include in a 'positive_highlights' field in the JSON output.
 
 2. Risk Severity
 - High (>25% NOI), moderate (10-25%), low (<10%); use qualitative severity if NOI is unknown.
@@ -80,7 +84,7 @@ Act as a Commercial Real Estate risk analyst. Using the provided JSON of lease c
 11. JSON Output
 {
   "lease_type": "NNN",
-  "risks": [{"type": "termination_early", "noi_impact": 120000, "severity": "high", "reason": "...", "manual_review": false, "page": 1}],
+  "risks": [{"type": "termination_early", "noi_impact": 120000, "calculation": "$120,000 = early termination penalty", "severity": "high", "reason": "...", "manual_review": false, "page": 1}],
   "risk_categories": {"termination": 120000, ...},
   "total_risk_impact": 165000,
   "deal_impact_score": 6.5,
@@ -90,6 +94,7 @@ Act as a Commercial Real Estate risk analyst. Using the provided JSON of lease c
   "security_measures": {"deposit": 20000, "guarantee": "Unknown", "tenant_credit": "Unknown"},
   "time_risks": [{"type": "lease_expiration", "date": "2025-05-31", "impact": "..."}],
   "market_comparison": {"rent_escalation": "Unknown", "cam_caps": "Unknown"},
+  "positive_highlights": ["Strong rent escalation to $70,000/month", "Tenant maintains $1M liability insurance"],
   "investor_summary": "..."
 }
 """
@@ -131,11 +136,26 @@ async def process_lease(request: Request):
             f.write(r.content)
         logger.info(f"PDF downloaded to {filename}")
 
-        # Extract text with pdfplumber
-        logger.info("Extracting text with pdfplumber")
-        with pdfplumber.open(filename) as pdf:
-            text = "".join(page.extract_text() or "" for page in pdf.pages)
-        logger.info(f"Extracted {len(text)} characters from PDF")
+        # Extract text with pdfplumber and fallback to Tesseract
+        def extract_text_from_pdf(filename):
+            try:
+                with pdfplumber.open(filename) as pdf:
+                    text = "".join(page.extract_text() or "" for page in pdf.pages)
+                if text and text.strip():
+                    logger.info("Text extracted successfully with pdfplumber")
+                    return text
+            except Exception as e:
+                logger.warning(f"pdfplumber failed: {str(e)}")
+            
+            # Fallback to Tesseract OCR
+            logger.info("Falling back to Tesseract OCR")
+            images = convert_from_path(filename, dpi=300)  # Higher DPI for better accuracy
+            text = "\n".join(pytesseract.image_to_string(image) for image in images)
+            logger.info(f"Extracted {len(text)} characters with Tesseract")
+            return text
+
+        text = extract_text_from_pdf(filename)
+        logger.info(f"Total extracted {len(text)} characters from PDF")
 
         # Claude prompt for comprehensive clause extraction
         claude_prompt = """
@@ -170,27 +190,27 @@ Confirm absence of clauses (e.g., "No co-tenancy found"). Output a JSON object:
 }
 Do not store or train on the text. Process in-memory and discard after output.
 """
-        # Claude API call with adjusted parameters
+        # Claude API call with increased max_tokens
         logger.info(f"Calling Claude API with prompt length: {len(claude_prompt)} and text length: {len(text)}")
         claude_response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": os.getenv("CLAUDE_API_KEY"),
                 "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01"  # Baseline version; check docs for newer version
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"  # Enable 8192 token output
             },
             json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 4000,
-                "messages": [{"role": "user", "content": f"{claude_prompt}\n{text[:25000]}"}]  # Reduced to 25k chars
+                "model": "claude-3-5-sonnet-20240620",
+                "max_tokens": 8192,  # Increased output limit
+                "messages": [{"role": "user", "content": f"{claude_prompt}\n{text[:200000]}"}]  # 200k token context
             },
-            timeout=120  # Increased to 120 seconds
+            timeout=120
         )
         logger.debug(f"Claude API response status: {claude_response.status_code}, headers: {claude_response.headers}")
         logger.debug(f"Claude API response body: {claude_response.text}")
         claude_response.raise_for_status()
         claude_result = claude_response.json().get("content", [{}])[0].get("text", "{}")
-        # Extract JSON string from markdown
         json_match = re.search(r'```json\n(.*)\n```', claude_result, re.DOTALL)
         if json_match:
             claude_data = json.loads(json_match.group(1))
@@ -198,39 +218,39 @@ Do not store or train on the text. Process in-memory and discard after output.
             raise ValueError("No valid JSON found in Claude response")
         logger.info(f"Claude API returned {len(claude_data.get('clauses', []))} clauses, trust_score: {claude_data.get('trust_score', 'N/A')}")
 
+        # Log rent schedule for verification
+        rent_clauses = [c for c in claude_data.get("clauses", []) if c.get("type").lower() == "rent"]
+        logger.info(f"Extracted rent clauses: {rent_clauses}")
+
         # Validate Claude output
         checklist = ["rent", "term", "termination", "co-tenancy", "CAM", "maintenance"]
         missing_clauses = [item for item in checklist if item not in [c["type"].lower() for c in claude_data.get("clauses", [])] + claude_data.get("missing_clauses", [])]
         if missing_clauses:
             logger.warning(f"Missing clauses: {', '.join(missing_clauses)}")
-            # Optional: Re-run Claude for missing clauses
-            pass
 
-        # Grok API call with /v1/messages endpoint
+        # Grok API call with increased max_tokens
         logger.info("Calling Grok API")
         grok_payload = {
-            "model": "grok-3",  # Adjust to the correct model name from documentation
+            "model": "grok-3",
             "messages": [
                 {"role": "system", "content": get_grok_risk_prompt()},
                 {"role": "user", "content": json.dumps(claude_data)}
             ],
-            "max_tokens": 4000  # Increased to accommodate full JSON
+            "max_tokens": 8192  # Increased output limit
         }
         logger.debug(f"Grok request payload: {json.dumps(grok_payload)}")
         grok_response = requests.post(
-            os.getenv("GROK_API_URL", "https://api.x.ai/v1/messages"),  # Ensure correct endpoint
+            os.getenv("GROK_API_URL", "https://api.x.ai/v1/messages"),
             headers={"Authorization": f"Bearer {os.getenv('GROK_API_KEY')}"},
             json=grok_payload,
-            timeout=120  # Increased to 120 seconds
+            timeout=120
         )
         logger.debug(f"Grok response status: {grok_response.status_code}, text: {grok_response.text}")
         grok_response.raise_for_status()
-        # Enhanced debugging for Grok response
         grok_json = grok_response.json()
         logger.debug(f"Grok full response: {grok_json}")
         grok_content = grok_json.get("choices", [{}])[0].get("message", {}).get("content", "")
         logger.debug(f"Grok raw content: {grok_content}")
-        # Extract JSON block using regex
         json_match = re.search(r'```json\n(.*)\n```', grok_content, re.DOTALL)
         if json_match:
             grok_data = json_match.group(1)
@@ -247,7 +267,7 @@ Do not store or train on the text. Process in-memory and discard after output.
         story = []
         story.append(Paragraph(f"<b>Lease Summary Report</b>", styles['Heading1']))
         story.append(Paragraph(f"<b>Property</b>: [Property Name]", styles['Normal']))
-        story.append(Paragraph(f"<b>Uploaded</b>: {os.getenv('CURRENT_DATE', '2025-07-17 23:30:00 CDT')}", styles['Normal']))  # Updated to current time
+        story.append(Paragraph(f"<b>Uploaded</b>: {os.getenv('CURRENT_DATE', '2025-07-18 00:07:00 CDT')}", styles['Normal']))  # Updated to current time
         story.append(Paragraph(f"<b>Generated by</b>: LeaseScan AI", styles['Normal']))
         story.append(Paragraph(f"<b>Trust Score</b>: {claude_data.get('trust_score', 95)}%", styles['Normal']))
         story.append(Spacer(1, 12))
@@ -258,15 +278,39 @@ Do not store or train on the text. Process in-memory and discard after output.
             story.append(Paragraph(f"- <b>Missing Clauses</b>: {', '.join(clause.title() for clause in claude_data['missing_clauses'])}", styles['Normal']))
         story.append(Spacer(1, 12))
         story.append(Paragraph("<b>Risk Flags</b>", styles['Heading2']))
-        if not grok_result.get("risks"):
+        # Categorize risks by severity
+        high_risks = [r for r in grok_result.get("risks", []) if r.get("severity", "").lower() == "high"]
+        moderate_risks = [r for r in grok_result.get("risks", []) if r.get("severity", "").lower() == "moderate"]
+        low_risks = [r for r in grok_result.get("risks", []) if r.get("severity", "").lower() == "low"]
+        if high_risks:
+            story.append(Paragraph("<b>High Risk</b>", styles['Heading3']))
+            for risk in high_risks:
+                readable_type = risk['type'].replace("_", " ").title()
+                story.append(Paragraph(f"- <b>{readable_type}</b> (Page {risk.get('page', 'N/A')}): ${risk['noi_impact']}/year ({risk.get('calculation', 'N/A')})", styles['Normal']))
+        if moderate_risks:
+            story.append(Paragraph("<b>Moderate Risk</b>", styles['Heading3']))
+            for risk in moderate_risks:
+                readable_type = risk['type'].replace("_", " ").title()
+                story.append(Paragraph(f"- <b>{readable_type}</b> (Page {risk.get('page', 'N/A')}): ${risk['noi_impact']}/year ({risk.get('calculation', 'N/A')})", styles['Normal']))
+        if low_risks:
+            story.append(Paragraph("<b>Low Risk</b>", styles['Heading3']))
+            for risk in low_risks:
+                readable_type = risk['type'].replace("_", " ").title()
+                story.append(Paragraph(f"- <b>{readable_type}</b> (Page {risk.get('page', 'N/A')}): ${risk['noi_impact']}/year ({risk.get('calculation', 'N/A')})", styles['Normal']))
+        if not (high_risks or moderate_risks or low_risks):
             story.append(Paragraph("- <b>No Significant Risks Found</b>: All clauses indicate low or no financial/operational risk.", styles['Normal']))
-        for risk in grok_result.get("risks", []):
-            story.append(Paragraph(f"- <b>{risk['type'].title()}</b> (Page {risk.get('page', 'N/A')}): ${risk['noi_impact']}/year, {risk['severity']} risk", styles['Normal']))
         if grok_result.get("review_manually"):
             story.append(Spacer(1, 12))
             story.append(Paragraph("<b>Review Manually to Validate</b>", styles['Heading2']))
             for item in grok_result["review_manually"]:
-                story.append(Paragraph(f"- <b>Page {item['page']}, {item['type'].title()}</b>: {item['reason']}", styles['Normal']))
+                readable_type = item['type'].replace("_", " ").title()
+                story.append(Paragraph(f"- <b>Page {item['page']}, {readable_type}</b>: {item['reason']}", styles['Normal']))
+        story.append(Spacer(1, 12))
+        # Add Positive Highlights section
+        if grok_result.get("positive_highlights"):
+            story.append(Paragraph("<b>Positive Highlights</b>", styles['Heading2']))
+            for highlight in grok_result.get("positive_highlights", []):
+                story.append(Paragraph(f"- {highlight}", styles['Normal']))
         story.append(Spacer(1, 12))
         story.append(Paragraph("<b>Investor Summary</b>", styles['Heading2']))
         story.append(Paragraph(grok_result.get('investor_summary', 'Stable lease with minimal risks.'), styles['Normal']))
